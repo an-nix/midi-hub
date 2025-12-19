@@ -1,0 +1,16 @@
+[Unit]
+Description=BLE MIDI to ALSA Bridge
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+User=piamp
+WorkingDirectory=/home/piamp/ble-midi
+ExecStart=/home/piamp/ble-midi/target/release/ble-midi-bridge
+Restart=always
+RestartSec=3
+Environment="RUST_LOG=info"
+
+[Install]
+WantedBy=multi-user.target
