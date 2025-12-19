@@ -12,10 +12,41 @@ use uuid::Uuid;
 use zbus::{dbus_interface, ConnectionBuilder, Connection};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use serde::Deserialize;
+use std::fs;
 
 const MIDI_SERVICE_UUID: Uuid = Uuid::from_u128(0x03b80e5a_ede8_4b33_a751_6ce34ec4c700);
 const MIDI_CHAR_UUID: Uuid = Uuid::from_u128(0x7772e5db_3868_4112_a1a9_f2669d106bf3);
-const DEVICE_MAC: &str = "52:17:32:38:20:BF";
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    /// Target device MAC address (format: AA:BB:CC:DD:EE:FF)
+    device_mac: String,
+    /// Optional ALSA port name (defaults to "BLE-MIDI-Bridge")
+    alsa_port: Option<String>,
+}
+
+fn load_config() -> Result<Config, Box<dyn Error>> {
+    // Search common locations: /etc/midi-hub/config.json, ./config.json
+    let candidates = ["/etc/midi-hub/config.json", "./config.json"];
+
+    for path in &candidates {
+        if let Ok(s) = fs::read_to_string(path) {
+            let cfg: Config = serde_json::from_str(&s)?;
+            log::info!("Loaded config from {}", path);
+            return Ok(cfg);
+        }
+    }
+
+    // If none found, try to read a bundled sample (project root)
+    if let Ok(s) = fs::read_to_string("config.json") {
+        let cfg: Config = serde_json::from_str(&s)?;
+        log::info!("Loaded config from ./config.json");
+        return Ok(cfg);
+    }
+
+    Err("No config.json found in /etc/midi-hub or current directory".into())
+}
 
 // BlueZ Agent for auto-authorizing pairing
 struct Agent1;
@@ -172,9 +203,9 @@ impl AlsaBridge {
     }
 }
 
-async fn find_device(adapter: &Adapter) -> Result<Peripheral, Box<dyn Error>> {
-    log::info!("Scanning for device {}...", DEVICE_MAC);
-    
+async fn find_device(adapter: &Adapter, device_mac: &str) -> Result<Peripheral, Box<dyn Error>> {
+    log::info!("Scanning for device {}...", device_mac);
+
     adapter.start_scan(ScanFilter::default()).await?;
     
     let start = std::time::Instant::now();
@@ -186,9 +217,9 @@ async fn find_device(adapter: &Adapter) -> Result<Peripheral, Box<dyn Error>> {
                     props.local_name.as_deref().unwrap_or("Unknown"), 
                     addr_str);
                 
-                // Check if address contains our MAC
-                if addr_str.to_uppercase().contains(&DEVICE_MAC.replace(":", "_").to_uppercase()) ||
-                   addr_str.to_uppercase().contains(&DEVICE_MAC.to_uppercase()) {
+                     // Check if address contains our MAC
+                     if addr_str.to_uppercase().contains(&device_mac.replace(":", "_").to_uppercase()) ||
+                         addr_str.to_uppercase().contains(&device_mac.to_uppercase()) {
                     log::info!("Matched device: {} ({})", 
                         props.local_name.as_deref().unwrap_or("Unknown"),
                         addr_str);
@@ -283,19 +314,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     
-    let mut alsa = AlsaBridge::new("BLE-MIDI-Bridge")?;
+    // Load config (try /etc/midi-hub/config.json, then ./config.json)
+    let config = match load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Failed to load config.json: {}. Falling back to default MAC 52:17:32:38:20:BF", e);
+            Config { device_mac: "52:17:32:38:20:BF".to_string(), alsa_port: None }
+        }
+    };
+
+    let port_name = config.alsa_port.as_deref().unwrap_or("BLE-MIDI-Bridge");
+    let mut alsa = AlsaBridge::new(port_name)?;
     
     let manager = Manager::new().await?;
     let adapters = manager.adapters().await?;
     let adapter = adapters.into_iter().next().ok_or("No Bluetooth adapter found")?;
     
     loop {
-        match find_device(&adapter).await {
+        match find_device(&adapter, &config.device_mac).await {
             Ok(peripheral) => {
                 log::info!("Device found, attempting pairing and connection...");
                 
                 // First, pair and trust the device via D-Bus
-                if let Err(e) = pair_trust_device_via_dbus(DEVICE_MAC).await {
+                if let Err(e) = pair_trust_device_via_dbus(&config.device_mac).await {
                     log::error!("Failed to pair/trust via D-Bus: {}", e);
                 }
                 

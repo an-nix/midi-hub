@@ -14,14 +14,28 @@ This application creates a stable virtual ALSA MIDI port and automatically conne
 - Rust toolchain (installed automatically via the setup script or manually via rustup).
 - System dependencies: `libasound2-dev`, `libdbus-1-dev`, `pkg-config`.
 
+## Configuration
+
+Create a `config.json` in `/etc/midi-hub/config.json` or in the project root. Example (`config.json.sample` included):
+
+```
+{
+    "device_mac": "52:17:32:38:20:BF",
+    "alsa_port": "BLE-MIDI-Bridge"
+}
+```
+
+`device_mac` is the BLE device MAC address to connect to. `alsa_port` is optional and defaults to `BLE-MIDI-Bridge`.
+
 ## Building and Running
 
-1.  **Build the project:**
+1.  **Build & Install (recommended):**
     ```bash
-    cargo build --release
+    # from project root
+    sudo ./scripts/install.sh
     ```
 
-2.  **Run the bridge:**
+2.  **Run for development (not installed):**
     ```bash
     cargo run --release
     ```
