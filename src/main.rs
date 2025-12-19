@@ -180,26 +180,61 @@ async fn pair_trust_device_via_dbus(device_mac: &str) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
+use std::collections::HashMap;
+
 struct AlsaBridge {
-    conn_out: midir::MidiOutputConnection,
+    outputs: HashMap<String, midir::MidiOutputConnection>,
 }
 
 impl AlsaBridge {
-    fn new(port_name: &str) -> Result<Self, Box<dyn Error>> {
-        let midi_out = MidiOutput::new(port_name)?;
-        let conn_out = midi_out.create_virtual(port_name)?;
-        log::info!("Created ALSA virtual port: {}", port_name);
-        Ok(AlsaBridge { conn_out })
+    fn new() -> Result<Self, Box<dyn Error>> {
+        Ok(AlsaBridge { outputs: HashMap::new() })
     }
 
-    fn send_midi(&mut self, data: &[u8]) {
-        if data.len() >= 3 {
-            // Skip BLE MIDI header (first 2 bytes: header + timestamp)
-            let midi_data = &data[2..];
-            if let Err(e) = self.conn_out.send(midi_data) {
-                log::error!("Failed to send MIDI: {}", e);
+    /// Create a virtual ALSA output port with the requested name. If the name
+    /// already exists, append a numeric suffix until creation succeeds.
+    fn create_port(&mut self, base_name: &str) -> Result<String, Box<dyn Error>> {
+        let mut attempt = 0;
+        loop {
+            let name = if attempt == 0 {
+                base_name.to_string()
             } else {
-                log::info!("MIDI event: {:02x?}", midi_data);
+                format!("{}-{}", base_name, attempt)
+            };
+
+            match MidiOutput::new(&name) {
+                Ok(midi_out) => match midi_out.create_virtual(&name) {
+                    Ok(conn) => {
+                        log::info!("Created ALSA virtual port: {}", name);
+                        self.outputs.insert(name.clone(), conn);
+                        return Ok(name);
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to create virtual port '{}': {}", name, e);
+                        attempt += 1;
+                        if attempt > 8 { return Err(format!("Failed to create virtual port for {}", base_name).into()); }
+                    }
+                },
+                Err(e) => {
+                    log::warn!("Failed to initialize MidiOutput for '{}': {}", base_name, e);
+                    attempt += 1;
+                    if attempt > 8 { return Err(format!("Failed to create virtual port for {}", base_name).into()); }
+                }
+            }
+        }
+    }
+
+    fn send_midi_to(&mut self, port_name: &str, data: &[u8]) {
+        if data.len() >= 3 {
+            let midi_data = &data[2..];
+            if let Some(conn) = self.outputs.get_mut(port_name) {
+                if let Err(e) = conn.send(midi_data) {
+                    log::error!("Failed to send MIDI to {}: {}", port_name, e);
+                } else {
+                    log::info!("[{}] MIDI event: {:02x?}", port_name, midi_data);
+                }
+            } else {
+                log::warn!("No ALSA output named {}", port_name);
             }
         }
     }
@@ -240,6 +275,7 @@ async fn find_device(adapter: &Adapter, device_mac: &str) -> Result<Peripheral, 
 async fn connect_and_forward(
     peripheral: &Peripheral,
     alsa: Arc<Mutex<AlsaBridge>>,
+    port_name: String,
 ) -> Result<(), Box<dyn Error>> {
     log::info!("Connecting to device...");
     
@@ -282,9 +318,9 @@ async fn connect_and_forward(
     loop {
         tokio::select! {
             Some(data) = notification_stream.next() => {
-                // Lock ALSA bridge and send MIDI
+                // Lock ALSA bridge and send MIDI to the device-specific port
                 let mut guard = alsa.lock().await;
-                guard.send_midi(&data.value);
+                guard.send_midi_to(&port_name, &data.value);
             }
             _ = rx.recv() => {
                 log::warn!("Connection lost");
@@ -327,8 +363,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let port_name = config.alsa_port.as_deref().unwrap_or("BLE-MIDI-Bridge");
-    let alsa = AlsaBridge::new(port_name)?;
+    let _default_port = config.alsa_port.as_deref().unwrap_or("BLE-MIDI-Bridge");
+    let alsa = AlsaBridge::new()?;
     let alsa = Arc::new(Mutex::new(alsa));
 
     let manager = Manager::new().await?;
@@ -349,8 +385,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     log::info!("Managing {} device(s): {:?}", devices.len(), devices);
 
+    // Pre-create one virtual ALSA port per device and store mapping
+    let mut device_ports: Vec<(String, String)> = Vec::new();
+    for dev in &devices {
+        // sanitize base port name: midi-hub-<macno-colon>
+        let mac_short = dev.replace(':', "").to_lowercase();
+        let base = format!("midi-hub-{}", mac_short);
+        let mut guard = alsa.lock().await;
+        match guard.create_port(&base) {
+            Ok(created) => {
+                device_ports.push((dev.clone(), created));
+            }
+            Err(e) => {
+                log::error!("Failed to create ALSA port for {}: {}", dev, e);
+            }
+        }
+    }
+
     // Spawn one task per device to manage scanning, pairing and forwarding
-    for dev in devices.into_iter() {
+    for (dev, port_name) in device_ports.into_iter() {
         let adapter_clone = adapter.clone();
         let alsa_clone = alsa.clone();
         tokio::spawn(async move {
@@ -362,7 +415,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             log::error!("[{}] Failed to pair/trust via D-Bus: {}", dev, e);
                         }
 
-                        if let Err(e) = connect_and_forward(&peripheral, alsa_clone.clone()).await {
+                        if let Err(e) = connect_and_forward(&peripheral, alsa_clone.clone(), port_name.clone()).await {
                             log::error!("[{}] Connection error: {}", dev, e);
                         }
                         log::info!("[{}] Disconnected, waiting 5s before reconnect...", dev);
