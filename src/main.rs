@@ -28,7 +28,7 @@ struct Config {
     alsa_port: Option<String>,
 }
 
-fn load_config() -> Result<Config, Box<dyn Error>> {
+fn load_config() -> Result<Config, Box<dyn Error + Send + Sync>> {
     // Search common locations: /etc/midi-hub/config.json, ./config.json
     let candidates = ["/etc/midi-hub/config.json", "./config.json"];
 
@@ -101,7 +101,7 @@ impl Agent1 {
     }
 }
 
-async fn register_agent() -> Result<Connection, Box<dyn Error>> {
+async fn register_agent() -> Result<Connection, Box<dyn Error + Send + Sync>> {
     log::info!("Registering BlueZ agent...");
     
     let agent = Agent1;
@@ -135,7 +135,7 @@ async fn register_agent() -> Result<Connection, Box<dyn Error>> {
     Ok(conn)
 }
 
-async fn pair_trust_device_via_dbus(device_mac: &str) -> Result<(), Box<dyn Error>> {
+async fn pair_trust_device_via_dbus(device_mac: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let conn = zbus::Connection::system().await?;
     
     // Convert MAC to BlueZ object path
@@ -187,21 +187,35 @@ struct AlsaBridge {
 }
 
 impl AlsaBridge {
-    fn new() -> Result<Self, Box<dyn Error>> {
+    fn new() -> Result<Self, Box<dyn Error + Send + Sync>> {
         Ok(AlsaBridge { outputs: HashMap::new() })
     }
 
     /// Create a virtual ALSA output port with the requested name. If the name
     /// already exists, append a numeric suffix until creation succeeds.
-    fn create_port(&mut self, base_name: &str) -> Result<String, Box<dyn Error>> {
+    fn create_port(&mut self, base_name: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+        // Try to create a virtual port with base_name, but first attempt to reuse
+        // any existing ALSA output that already exposes the same port name.
+        // This avoids creating duplicate virtual ports when restarting.
+        // First, probe existing output ports for a matching name.
+        if let Ok(probe_out) = MidiOutput::new("midi-hub-probe") {
+            for p in probe_out.ports() {
+                if let Ok(pname) = probe_out.port_name(&p) {
+                    if pname == base_name {
+                        // Connect to existing port
+                        if let Ok(conn) = probe_out.connect(&p, &format!("midi-hub-to-{}", base_name)) {
+                            log::info!("Reusing existing ALSA port: {}", base_name);
+                            self.outputs.insert(base_name.to_string(), conn);
+                            return Ok(base_name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
         let mut attempt = 0;
         loop {
-            let name = if attempt == 0 {
-                base_name.to_string()
-            } else {
-                format!("{}-{}", base_name, attempt)
-            };
-
+            let name = if attempt == 0 { base_name.to_string() } else { format!("{}-{}", base_name, attempt) };
             match MidiOutput::new(&name) {
                 Ok(midi_out) => match midi_out.create_virtual(&name) {
                     Ok(conn) => {
@@ -224,6 +238,14 @@ impl AlsaBridge {
         }
     }
 
+    /// Get existing port by name or create it. Returns the actual port name used.
+    fn get_or_create_port(&mut self, base_name: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+        if self.outputs.contains_key(base_name) {
+            return Ok(base_name.to_string());
+        }
+        self.create_port(base_name)
+    }
+
     fn send_midi_to(&mut self, port_name: &str, data: &[u8]) {
         if data.len() >= 3 {
             let midi_data = &data[2..];
@@ -240,7 +262,7 @@ impl AlsaBridge {
     }
 }
 
-async fn find_device(adapter: &Adapter, device_mac: &str) -> Result<Peripheral, Box<dyn Error>> {
+async fn find_device(adapter: &Adapter, device_mac: &str) -> Result<Peripheral, Box<dyn Error + Send + Sync>> {
     log::info!("Scanning for device {}...", device_mac);
 
     adapter.start_scan(ScanFilter::default()).await?;
@@ -276,7 +298,7 @@ async fn connect_and_forward(
     peripheral: &Peripheral,
     alsa: Arc<Mutex<AlsaBridge>>,
     port_name: String,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     log::info!("Connecting to device...");
     
     // Connect (this may trigger pairing/authorization on the device side)
@@ -337,7 +359,7 @@ async fn connect_and_forward(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     
     log::info!("Starting BLE-MIDI Bridge (Rust)...");
@@ -410,7 +432,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
             loop {
                 match find_device(&adapter_clone, &dev).await {
                     Ok(peripheral) => {
-                        log::info!("[{}] Device found, attempting pairing and connection...", dev);
+                        // Move port creation to after device discovery to use local_name
+                        let props = peripheral.properties().await.ok().flatten();
+                        let local_name = props.as_ref().and_then(|p| p.local_name.clone()).unwrap_or_else(|| "device".to_string());
+                        let mac_short = dev.replace(':', "").to_lowercase();
+                        // sanitize local_name to ASCII alnum and hyphens
+                        let sanitized: String = local_name.chars().map(|c| {
+                            if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() }
+                            else if c.is_ascii_whitespace() || c == '-' || c == '_' { '-' }
+                            else { '-' }
+                        }).collect();
+                        let base = format!("{}-{}", sanitized.trim_matches('-'), mac_short);
+
+                        // Ensure we have a port for this device
+                        let port_name = {
+                            let mut g = alsa_clone.lock().await;
+                            match g.get_or_create_port(&base) {
+                                Ok(n) => n,
+                                Err(e) => {
+                                    log::error!("[{}] Failed to create/get ALSA port: {}", dev, e);
+                                    time::sleep(Duration::from_secs(5)).await;
+                                    continue;
+                                }
+                            }
+                        };
+
+                        log::info!("[{}] Device found ({}), attempting pairing and connection to port {}...", dev, local_name, port_name);
                         if let Err(e) = pair_trust_device_via_dbus(&dev).await {
                             log::error!("[{}] Failed to pair/trust via D-Bus: {}", dev, e);
                         }
@@ -422,7 +469,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         time::sleep(Duration::from_secs(5)).await;
                     }
                     Err(e) => {
-                        log::error!("[{}] Discovery error: {}, retrying in 5s...", dev, e);
+                        let msg = e.to_string();
+                        log::error!("[{}] Discovery error: {}, retrying in 5s...", dev, msg);
                         time::sleep(Duration::from_secs(5)).await;
                     }
                 }
@@ -432,4 +480,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Keep the main task alive indefinitely
     futures::future::pending::<()>().await;
+
+    Ok(())
 }
