@@ -20,8 +20,10 @@ const MIDI_CHAR_UUID: Uuid = Uuid::from_u128(0x7772e5db_3868_4112_a1a9_f2669d106
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    /// Target device MAC address (format: AA:BB:CC:DD:EE:FF)
-    device_mac: String,
+    /// Single device MAC (backwards compatibility)
+    device_mac: Option<String>,
+    /// Multiple device MACs to manage (preferred)
+    device_macs: Option<Vec<String>>,
     /// Optional ALSA port name (defaults to "BLE-MIDI-Bridge")
     alsa_port: Option<String>,
 }
@@ -237,7 +239,7 @@ async fn find_device(adapter: &Adapter, device_mac: &str) -> Result<Peripheral, 
 
 async fn connect_and_forward(
     peripheral: &Peripheral,
-    alsa: &mut AlsaBridge,
+    alsa: Arc<Mutex<AlsaBridge>>,
 ) -> Result<(), Box<dyn Error>> {
     log::info!("Connecting to device...");
     
@@ -280,7 +282,9 @@ async fn connect_and_forward(
     loop {
         tokio::select! {
             Some(data) = notification_stream.next() => {
-                alsa.send_midi(&data.value);
+                // Lock ALSA bridge and send MIDI
+                let mut guard = alsa.lock().await;
+                guard.send_midi(&data.value);
             }
             _ = rx.recv() => {
                 log::warn!("Connection lost");
@@ -319,38 +323,60 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Ok(c) => c,
         Err(e) => {
             log::warn!("Failed to load config.json: {}. Falling back to default MAC 52:17:32:38:20:BF", e);
-            Config { device_mac: "52:17:32:38:20:BF".to_string(), alsa_port: None }
+            Config { device_mac: Some("52:17:32:38:20:BF".to_string()), device_macs: None, alsa_port: None }
         }
     };
 
     let port_name = config.alsa_port.as_deref().unwrap_or("BLE-MIDI-Bridge");
-    let mut alsa = AlsaBridge::new(port_name)?;
-    
+    let alsa = AlsaBridge::new(port_name)?;
+    let alsa = Arc::new(Mutex::new(alsa));
+
     let manager = Manager::new().await?;
     let adapters = manager.adapters().await?;
     let adapter = adapters.into_iter().next().ok_or("No Bluetooth adapter found")?;
-    
-    loop {
-        match find_device(&adapter, &config.device_mac).await {
-            Ok(peripheral) => {
-                log::info!("Device found, attempting pairing and connection...");
-                
-                // First, pair and trust the device via D-Bus
-                if let Err(e) = pair_trust_device_via_dbus(&config.device_mac).await {
-                    log::error!("Failed to pair/trust via D-Bus: {}", e);
-                }
-                
-                // Now connect via btleplug
-                if let Err(e) = connect_and_forward(&peripheral, &mut alsa).await {
-                    log::error!("Connection error: {}", e);
-                }
-                log::info!("Disconnected, waiting 5s before reconnect...");
-                time::sleep(Duration::from_secs(5)).await;
-            }
-            Err(e) => {
-                log::error!("Discovery error: {}, retrying in 5s...", e);
-                time::sleep(Duration::from_secs(5)).await;
-            }
-        }
+
+    // Build a list of device MACs from config (support both legacy `device_mac` and `device_macs`)
+    let mut devices: Vec<String> = Vec::new();
+    if let Some(v) = config.device_macs {
+        devices.extend(v.into_iter());
     }
+    if let Some(s) = config.device_mac {
+        devices.push(s);
+    }
+    if devices.is_empty() {
+        devices.push("52:17:32:38:20:BF".to_string());
+    }
+
+    log::info!("Managing {} device(s): {:?}", devices.len(), devices);
+
+    // Spawn one task per device to manage scanning, pairing and forwarding
+    for dev in devices.into_iter() {
+        let adapter_clone = adapter.clone();
+        let alsa_clone = alsa.clone();
+        tokio::spawn(async move {
+            loop {
+                match find_device(&adapter_clone, &dev).await {
+                    Ok(peripheral) => {
+                        log::info!("[{}] Device found, attempting pairing and connection...", dev);
+                        if let Err(e) = pair_trust_device_via_dbus(&dev).await {
+                            log::error!("[{}] Failed to pair/trust via D-Bus: {}", dev, e);
+                        }
+
+                        if let Err(e) = connect_and_forward(&peripheral, alsa_clone.clone()).await {
+                            log::error!("[{}] Connection error: {}", dev, e);
+                        }
+                        log::info!("[{}] Disconnected, waiting 5s before reconnect...", dev);
+                        time::sleep(Duration::from_secs(5)).await;
+                    }
+                    Err(e) => {
+                        log::error!("[{}] Discovery error: {}, retrying in 5s...", dev, e);
+                        time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        });
+    }
+
+    // Keep the main task alive indefinitely
+    futures::future::pending::<()>().await;
 }

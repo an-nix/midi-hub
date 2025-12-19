@@ -20,7 +20,10 @@ Create a `config.json` in `/etc/midi-hub/config.json` or in the project root. Ex
 
 ```
 {
-    "device_mac": "52:17:32:38:20:BF",
+    "device_macs": [
+        "52:17:32:38:20:BF",
+        "AA:BB:CC:DD:EE:FF"
+    ],
     "alsa_port": "BLE-MIDI-Bridge"
 }
 ```
