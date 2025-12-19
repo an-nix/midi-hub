@@ -199,11 +199,22 @@ impl AlsaBridge {
         // This avoids creating duplicate virtual ports when restarting.
         // First, probe existing output ports for a matching name.
         if let Ok(probe_out) = MidiOutput::new("midi-hub-probe") {
-            for p in probe_out.ports() {
-                if let Ok(pname) = probe_out.port_name(&p) {
+            let ports = probe_out.ports();
+            let mut matching_index: Option<usize> = None;
+            for (i, p) in ports.iter().enumerate() {
+                if let Ok(pname) = probe_out.port_name(p) {
                     if pname == base_name {
-                        // Connect to existing port
-                        if let Ok(conn) = probe_out.connect(&p, &format!("midi-hub-to-{}", base_name)) {
+                        matching_index = Some(i);
+                        break;
+                    }
+                }
+            }
+            if let Some(i) = matching_index {
+                // Create a fresh MidiOutput and connect to the matching port index
+                if let Ok(reuse_out) = MidiOutput::new("midi-hub-reuse") {
+                    let ports2 = reuse_out.ports();
+                    if i < ports2.len() {
+                        if let Ok(conn) = reuse_out.connect(&ports2[i], &format!("midi-hub-to-{}", base_name)) {
                             log::info!("Reusing existing ALSA port: {}", base_name);
                             self.outputs.insert(base_name.to_string(), conn);
                             return Ok(base_name.to_string());
