@@ -1,4 +1,4 @@
-# BLE MIDI to ALSA Bridge (Rust)
+# midi-hub — BLE/USB MIDI bridge to a stable ALSA port
 
 This application creates a stable virtual ALSA MIDI port and automatically connects to BLE MIDI devices. It bridges the BLE MIDI data to the ALSA port, ensuring that applications like PiPedal can stay connected to the ALSA port even if the BLE connection drops and reconnects.
 
