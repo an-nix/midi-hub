@@ -135,6 +135,27 @@ async fn register_agent() -> Result<Connection, Box<dyn Error + Send + Sync>> {
     Ok(conn)
 }
 
+async fn is_device_paired(device_mac: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let conn = zbus::Connection::system().await?;
+    
+    // Convert MAC to BlueZ object path
+    let device_path_str = format!("/org/bluez/hci0/dev_{}", device_mac.replace(":", "_"));
+    let device_path = zbus::zvariant::ObjectPath::try_from(device_path_str.as_str())?;
+    
+    let device_proxy = zbus::Proxy::new(
+        &conn,
+        "org.bluez",
+        device_path,
+        "org.bluez.Device1",
+    ).await?;
+    
+    // Try to get Paired property using cached property interface
+    match device_proxy.get_property::<bool>("Paired").await {
+        Ok(paired) => Ok(paired),
+        Err(_) => Ok(false), // If we can't read the property, assume not paired
+    }
+}
+
 async fn pair_trust_device_via_dbus(device_mac: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let conn = zbus::Connection::system().await?;
     
@@ -142,23 +163,30 @@ async fn pair_trust_device_via_dbus(device_mac: &str) -> Result<(), Box<dyn Erro
     let device_path_str = format!("/org/bluez/hci0/dev_{}", device_mac.replace(":", "_"));
     let device_path = zbus::zvariant::ObjectPath::try_from(device_path_str.as_str())?;
     
-    log::info!("Pairing device via D-Bus: {}", device_path);
+    // Check if device is already paired
+    let already_paired = is_device_paired(device_mac).await.unwrap_or(false);
     
-    // Call Device1.Pair
-    let device_proxy = zbus::Proxy::new(
-        &conn,
-        "org.bluez",
-        device_path.clone(),
-        "org.bluez.Device1",
-    ).await?;
-    
-    match device_proxy.call_method("Pair", &()).await {
-        Ok(_) => log::info!("Pairing successful"),
-        Err(e) => log::warn!("Pairing failed (may already be paired): {}", e),
+    if already_paired {
+        log::info!("Device already paired, skipping pairing step");
+    } else {
+        log::info!("Pairing device via D-Bus: {}", device_path);
+        
+        // Call Device1.Pair
+        let device_proxy = zbus::Proxy::new(
+            &conn,
+            "org.bluez",
+            device_path.clone(),
+            "org.bluez.Device1",
+        ).await?;
+        
+        match device_proxy.call_method("Pair", &()).await {
+            Ok(_) => log::info!("Pairing successful"),
+            Err(e) => log::warn!("Pairing failed: {}", e),
+        }
+        
+        // Wait a bit for pairing to complete
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    
-    // Wait a bit for pairing to complete
-    tokio::time::sleep(Duration::from_secs(2)).await;
     
     log::info!("Setting device as trusted...");
     
@@ -418,25 +446,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     log::info!("Managing {} device(s): {:?}", devices.len(), devices);
 
-    // Pre-create one virtual ALSA port per device and store mapping
-    let mut device_ports: Vec<(String, String)> = Vec::new();
-    for dev in &devices {
-        // sanitize base port name: midi-hub-<macno-colon>
-        let mac_short = dev.replace(':', "").to_lowercase();
-        let base = format!("midi-hub-{}", mac_short);
-        let mut guard = alsa.lock().await;
-        match guard.create_port(&base) {
-            Ok(created) => {
-                device_ports.push((dev.clone(), created));
-            }
-            Err(e) => {
-                log::error!("Failed to create ALSA port for {}: {}", dev, e);
-            }
-        }
-    }
-
     // Spawn one task per device to manage scanning, pairing and forwarding
-    for (dev, port_name) in device_ports.into_iter() {
+    for dev in devices.into_iter() {
         let adapter_clone = adapter.clone();
         let alsa_clone = alsa.clone();
         tokio::spawn(async move {
@@ -446,14 +457,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         // Move port creation to after device discovery to use local_name
                         let props = peripheral.properties().await.ok().flatten();
                         let local_name = props.as_ref().and_then(|p| p.local_name.clone()).unwrap_or_else(|| "device".to_string());
-                        let mac_short = dev.replace(':', "").to_lowercase();
                         // sanitize local_name to ASCII alnum and hyphens
                         let sanitized: String = local_name.chars().map(|c| {
                             if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() }
                             else if c.is_ascii_whitespace() || c == '-' || c == '_' { '-' }
                             else { '-' }
                         }).collect();
-                        let base = format!("{}-{}", sanitized.trim_matches('-'), mac_short);
+                        let base = format!("midi-hub-{}", sanitized.trim_matches('-'));
 
                         // Ensure we have a port for this device
                         let port_name = {
